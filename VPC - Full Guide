@@ -1,0 +1,516 @@
+# 🌐 AWS VPC — Complete Guide
+
+## What is a VPC?
+
+VPC stands for **Virtual Private Cloud**. It is a logically isolated virtual network within AWS where you launch your resources like EC2 instances, RDS databases, Lambda functions, etc.
+
+Think of it like this:
+
+```
+AWS Cloud (entire data center)
+└── Your VPC (your private section of that data center)
+    ├── Public Subnet  (reception area — internet can reach here)
+    └── Private Subnet (back office — internal only)
+```
+
+Before VPC existed, all AWS resources were on a flat shared network — anyone in AWS could potentially reach anyone else. VPC solved this by giving each customer their own isolated network.
+
+---
+
+## Why is VPC Needed?
+
+Without a VPC, your cloud infrastructure has no network boundaries. VPC solves these real problems:
+
+| Problem | How VPC Solves It |
+|---|---|
+| Resources exposed to internet by default | VPC lets you place resources in private subnets |
+| No control over who talks to who | Security Groups + NACLs give fine-grained control |
+| Compliance requirements (PCI, HIPAA) | VPC provides network isolation required by audits |
+| Need to connect cloud to on-premise | VPC supports VPN and Direct Connect |
+| Multi-tier app separation | Public subnet for LB, private for app, private for DB |
+
+**Real example at a bank:**
+```
+Internet Users
+      │
+  Load Balancer  ← Public subnet (accessible)
+      │
+  App Servers    ← Private subnet (not accessible from internet)
+      │
+  Database       ← Private subnet (only app servers can reach it)
+```
+Each layer is isolated — a hacker reaching the load balancer cannot directly reach the database.
+
+---
+
+## VPC Core Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Your VPC                              │
+│               CIDR: 10.0.0.0/16                         │
+│                                                         │
+│  ┌──────────────────┐    ┌──────────────────┐           │
+│  │  Public Subnet   │    │  Private Subnet  │           │
+│  │  10.0.1.0/24     │    │  10.0.2.0/24     │           │
+│  │                  │    │                  │           │
+│  │  Load Balancer   │    │  EC2 App Server  │           │
+│  │  NAT Gateway     │    │  RDS Database    │           │
+│  │  Bastion Host    │    │                  │           │
+│  └──────────────────┘    └──────────────────┘           │
+│                                                         │
+│  Route Table (public)    Route Table (private)          │
+│  NACL                    NACL                           │
+│  Security Groups         Security Groups                │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+         │                          │
+   Internet Gateway            NAT Gateway
+         │
+      Internet
+```
+
+---
+
+## CIDR Block
+
+CIDR (Classless Inter-Domain Routing) defines the IP address range of your VPC.
+
+```
+10.0.0.0/16  →  65,536 IP addresses  (10.0.0.0 to 10.0.255.255)
+10.0.0.0/24  →  256 IP addresses     (10.0.0.0 to 10.0.0.255)
+10.0.0.0/28  →  16 IP addresses      (smallest allowed in AWS)
+```
+
+AWS reserves **5 IPs** from every subnet:
+```
+10.0.1.0   → Network address
+10.0.1.1   → VPC router
+10.0.1.2   → DNS server
+10.0.1.3   → Reserved for future use
+10.0.1.255 → Broadcast address
+```
+So a /24 subnet gives you **251 usable IPs**, not 256.
+
+---
+
+## Subnets
+
+A subnet is a **segment of your VPC's IP range** placed in a specific Availability Zone.
+
+### Public Subnet
+- Has a route to the **Internet Gateway**
+- Resources can have public IPs
+- Used for: Load Balancers, Bastion Hosts, NAT Gateways
+
+### Private Subnet
+- No direct route to internet
+- Resources have only private IPs
+- Used for: App servers, Databases, Backend services
+
+### Isolated Subnet
+- No internet access at all (no IGW, no NAT)
+- Used for: Highly sensitive data, compliance workloads
+
+```
+Availability Zone 1          Availability Zone 2
+┌─────────────────┐          ┌─────────────────┐
+│ Public  10.0.1.0│          │ Public  10.0.3.0│
+│ Private 10.0.2.0│          │ Private 10.0.4.0│
+└─────────────────┘          └─────────────────┘
+```
+Always deploy across **2+ AZs** for high availability.
+
+---
+
+## Internet Gateway (IGW)
+
+An Internet Gateway is a **horizontally scaled, redundant VPC component** that allows communication between your VPC and the internet.
+
+```
+Internet
+   │
+Internet Gateway  ← attached to VPC (1 per VPC)
+   │
+Public Subnet
+   │
+EC2 / Load Balancer (must have public IP)
+```
+
+### How it works:
+- Performs **NAT** for instances with public IPs
+- Translates public IP ↔ private IP for inbound/outbound traffic
+- **Stateless** — does not block any traffic on its own (Security Groups/NACLs do that)
+
+### Key rules:
+- Only **1 IGW per VPC**
+- Must be **attached** to the VPC (detached IGW does nothing)
+- Subnet must have a **route** pointing to IGW (`0.0.0.0/0 → igw-xxx`)
+- EC2 must have a **public IP or Elastic IP**
+
+### Without IGW:
+```
+EC2 in public subnet → tries to reach internet → no route → fails
+```
+
+---
+
+## Route Table
+
+A Route Table contains **rules (routes)** that determine where network traffic is directed.
+
+Every subnet must be associated with a route table. If not explicitly associated, it uses the **main route table**.
+
+### How routes work:
+```
+Destination        Target
+10.0.0.0/16   →   local          (traffic within VPC stays local)
+0.0.0.0/0     →   igw-xxx        (everything else goes to internet)
+```
+
+### Public subnet route table:
+```
+Destination        Target
+10.0.0.0/16   →   local
+0.0.0.0/0     →   igw-0abc1234   ← internet route
+```
+
+### Private subnet route table:
+```
+Destination        Target
+10.0.0.0/16   →   local
+0.0.0.0/0     →   nat-0abc1234   ← outbound via NAT only
+```
+
+### Isolated subnet route table:
+```
+Destination        Target
+10.0.0.0/16   →   local          ← only internal traffic, no internet
+```
+
+### Route priority:
+Most specific route wins. `/32` beats `/24` beats `/16` beats `/0`.
+
+---
+
+## NAT Gateway
+
+NAT (Network Address Translation) Gateway allows instances in a **private subnet to initiate outbound internet connections** while **blocking inbound connections** from the internet.
+
+```
+Private EC2 (10.0.2.5)
+      │  wants to reach apt.ubuntu.com
+      ▼
+NAT Gateway (in public subnet, has Elastic IP)
+      │  replaces source IP: 10.0.2.5 → 52.x.x.x
+      ▼
+Internet Gateway
+      │
+   Internet
+      │  response comes back to 52.x.x.x
+      ▼
+NAT Gateway  ← translates back to 10.0.2.5
+      │
+Private EC2 ← gets the response
+```
+
+### NAT Gateway vs NAT Instance:
+
+| | NAT Gateway | NAT Instance |
+|---|---|---|
+| Managed by | AWS (fully managed) | You (EC2) |
+| Availability | Highly available per AZ | Single point of failure |
+| Bandwidth | Up to 100 Gbps | Limited by instance type |
+| Cost | Higher | Cheaper |
+| Recommended | ✅ Yes (production) | ❌ Legacy only |
+
+### Important:
+- Place NAT Gateway in **public subnet**
+- One NAT Gateway per AZ for high availability
+- Charges **hourly + per GB** processed — delete when not needed
+
+---
+
+## Load Balancer
+
+A Load Balancer **distributes incoming traffic** across multiple EC2 instances to ensure no single instance is overwhelmed.
+
+```
+Users (internet)
+      │
+Application Load Balancer  ← public subnet, internet-facing
+      │
+   ┌──┴──┐
+   │     │
+  EC2   EC2     ← private subnet, multiple AZs
+  AZ1   AZ2
+```
+
+### Types of Load Balancers in AWS:
+
+| Type | Use Case | Protocol |
+|---|---|---|
+| **ALB** (Application) | HTTP/HTTPS web apps, microservices | Layer 7 |
+| **NLB** (Network) | High performance, low latency, TCP/UDP | Layer 4 |
+| **GLB** (Gateway) | Security appliances, firewalls | Layer 3 |
+| **CLB** (Classic) | Legacy — avoid for new apps | Layer 4/7 |
+
+### ALB Key Concepts:
+
+**Listener** — checks for connection requests on a port
+```
+HTTP:80  →  forward to target group
+HTTP:8000 → forward to demoTG
+```
+
+**Target Group** — group of instances that receive traffic
+```
+demoTG
+  ├── EC2 i-0abc (10.0.2.5)  healthy ✅
+  └── EC2 i-0def (10.0.4.7)  healthy ✅
+```
+
+**Health Check** — LB pings instances regularly
+```
+Protocol: HTTP
+Path:     /
+Port:     8000
+Every 30 seconds → if unhealthy, stop sending traffic
+```
+
+**Sticky Sessions** — sends same user always to same instance (off by default)
+
+### Why load balancer is in public subnet but EC2 in private:
+```
+Internet → LB (public, has public IP) → EC2 (private, no public IP)
+```
+EC2s are never directly exposed — LB is the only entry point.
+
+---
+
+## Security Groups
+
+Security Groups act as a **virtual firewall at the instance level**.
+
+```
+EC2 Instance
+┌─────────────────────────┐
+│  Security Group         │
+│  Inbound:               │
+│    Port 8000 ← LB only  │
+│    Port 22   ← My IP    │
+│  Outbound:              │
+│    All traffic → 0.0.0.0│
+└─────────────────────────┘
+```
+
+### Key properties:
+- **Stateful** — if inbound traffic is allowed, return traffic is automatically allowed
+- **Allow rules only** — cannot explicitly deny (use NACL for deny)
+- **Evaluated as a whole** — all rules checked, most permissive wins
+- Applied to **ENI (Elastic Network Interface)** of the instance
+
+---
+
+## Network ACL (NACL)
+
+NACLs are **stateless firewalls at the subnet boundary**.
+
+```
+Internet
+   │
+Internet Gateway
+   │
+NACL  ← checked here (inbound)
+   │
+┌──────────────┐
+│    Subnet    │
+│    EC2       │
+└──────────────┘
+   │
+NACL  ← checked here (outbound)
+   │
+Internet Gateway
+```
+
+### Key properties:
+- **Stateless** — must explicitly allow both inbound AND return traffic
+- Has **Allow and Deny** rules
+- Rules evaluated **in order** (lowest number first, first match wins)
+- Default NACL allows all traffic
+
+### NACL vs Security Group:
+
+| | NACL | Security Group |
+|---|---|---|
+| Level | Subnet | Instance |
+| Stateful | ❌ No | ✅ Yes |
+| Deny rules | ✅ Yes | ❌ No |
+| Rule order | Sequential | All at once |
+| Return traffic | Must allow manually | Auto allowed |
+
+---
+
+## DNS in VPC
+
+Every VPC gets a built-in **DNS server** at the base CIDR + 2 address.
+
+```
+VPC CIDR: 10.0.0.0/16
+DNS Server: 10.0.0.2  (automatically available)
+```
+
+### VPC DNS Settings:
+
+**DNS Resolution** (`enableDnsSupport`) — allows instances to resolve DNS using AWS DNS
+- Default: **enabled**
+
+**DNS Hostnames** (`enableDnsHostnames`) — assigns public DNS names to instances with public IPs
+- Default: **disabled** (must enable manually for public DNS names)
+
+### How it works:
+```
+EC2 does: curl google.com
+   │
+   ▼
+Queries 10.0.0.2 (VPC DNS)
+   │
+   ▼
+Resolves to 142.250.x.x
+   │
+   ▼
+Traffic goes via IGW to internet
+```
+
+### Route 53 Private Hosted Zones:
+For custom internal domain names within your VPC:
+```
+myapp.internal  →  10.0.2.15  (private EC2)
+db.internal     →  10.0.3.20  (RDS instance)
+```
+Associates a Route 53 hosted zone with your VPC — instances resolve these names internally.
+
+---
+
+## VPC Endpoints
+
+Allow **private communication between your VPC and AWS services** without internet, IGW, or NAT.
+
+```
+Without VPC Endpoint:
+EC2 → NAT Gateway → Internet → S3  (costs money, leaves VPC)
+
+With VPC Endpoint:
+EC2 → VPC Endpoint → S3  (stays within AWS network, free)
+```
+
+### Types:
+
+**Gateway Endpoint** — for S3 and DynamoDB (free)
+```
+Route table entry:
+pl-xxxxx (S3)  →  vpce-xxxxx
+```
+
+**Interface Endpoint** — for most other AWS services (hourly charge)
+```
+Creates an ENI in your subnet with a private IP
+EC2 → ENI (private IP) → AWS Service
+```
+
+---
+
+## VPC Peering
+
+Connects **two VPCs** so resources can communicate using private IPs.
+
+```
+VPC A (10.0.0.0/16)  ←──peering──→  VPC B (172.16.0.0/16)
+```
+
+### Rules:
+- CIDR ranges must **not overlap**
+- Peering is **not transitive** — A↔B and B↔C does NOT mean A↔C
+- Works across **accounts and regions**
+- Must update route tables in both VPCs
+
+---
+
+## Bastion Host
+
+A Bastion Host (jump server) provides **secure SSH access to private subnet instances**.
+
+```
+Your Laptop
+     │  SSH port 22
+     ▼
+Bastion Host  ← public subnet, Elastic IP
+     │  SSH using private IP
+     ▼
+Private EC2   ← private subnet, no public IP
+```
+
+```bash
+# Connect to bastion
+ssh -i demo.pem ubuntu@<BASTION-PUBLIC-IP>
+
+# From bastion, connect to private instance
+ssh -i demo.pem ubuntu@10.0.2.15
+```
+
+---
+
+## Full Traffic Flow — End to End
+
+```
+User types: http://demolb-xxx.eu-north-1.elb.amazonaws.com:8000
+
+1. DNS resolves LB domain → public IP of ALB
+2. Request hits Internet Gateway
+3. NACL (public subnet inbound) → checked
+4. ALB (in public subnet) receives request
+5. ALB checks listener rule → forward to demoTG
+6. ALB picks healthy target (EC2 in private subnet)
+7. NACL (private subnet inbound) → checked
+8. EC2 Security Group inbound → checked (allow port 8000 from ALB SG)
+9. Python HTTP server handles request → returns HTML
+10. Response travels back same path in reverse
+11. User sees webpage
+```
+
+---
+
+## Quick Reference
+
+```
+VPC              → Your isolated network in AWS
+CIDR             → IP address range of VPC/subnet
+Subnet           → Segment of VPC in one AZ (public/private)
+IGW              → Connects VPC to internet (1 per VPC)
+Route Table      → Rules for where traffic goes
+NAT Gateway      → Private subnet outbound internet access
+Load Balancer    → Distributes traffic across instances
+Security Group   → Stateful firewall at instance level
+NACL             → Stateless firewall at subnet level
+DNS              → 10.0.0.2 built-in, Route 53 for custom names
+VPC Endpoint     → Private access to AWS services
+VPC Peering      → Connect two VPCs privately
+Bastion Host     → Jump server for private subnet SSH access
+Elastic IP       → Static public IP that persists
+ENI              → Virtual network card attached to instance
+```
+
+---
+
+## Common Mistakes to Avoid
+
+| Mistake | Fix |
+|---|---|
+| LB in private subnet | LB must be in **public subnet** |
+| EC2 has no public IP but no IGW route | Add IGW route to public subnet route table |
+| Forgot to enable DNS hostnames | Enable in VPC settings for public DNS names |
+| NAT Gateway in private subnet | NAT Gateway must be in **public subnet** |
+| One NAT Gateway for all AZs | Use one NAT Gateway **per AZ** for HA |
+| NACL missing return traffic rule | NACL is stateless — allow ephemeral ports 1024-65535 outbound |
+| Security group blocking LB to EC2 | EC2 SG must allow port from **LB security group** as source |
+| AMI from different region in Launch Template | AMI IDs are **region-specific** |
